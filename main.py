@@ -11,7 +11,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 import config
 import database as db
 
-# Включаем логирование (чтобы видеть ошибки)
+# Включаем логирование
 logging.basicConfig(level=logging.INFO)
 
 # Инициализируем бота и диспетчер
@@ -25,6 +25,7 @@ def get_main_keyboard():
     kb.button(text="📊 Статистика")
     kb.button(text="🧪 Пройти тест")
     kb.button(text="💡 Методики")
+    kb.button(text="📝 Глубокий опрос")   # <-- Новая кнопка
     kb.adjust(2)  # две кнопки в ряду
     return kb.as_markup(resize_keyboard=True)
 
@@ -37,27 +38,34 @@ def get_stats_period_keyboard():
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# ---------- Вопросы для ежедневного опроса ----------
+# ---------- Вопросы для ежедневного опроса (остаются без изменений) ----------
 QUESTIONS = [
     {"text": "Как вы себя чувствуете сегодня? (1 - ужасно, 5 - отлично)", "key": "feeling", "type": "scale", "min":1, "max":5},
     {"text": "Оцените уровень тревоги (1 - нет, 5 - очень высокая)", "key": "anxiety", "type": "scale", "min":1, "max":5},
     {"text": "Были ли сегодня вспышки агрессии? (0 - нет, 1 - да)", "key": "aggression", "type": "binary"},
 ]
 
-# Хранилище состояний опроса (временное, в оперативной памяти)
-# Ключ: user_id, значение: индекс текущего вопроса и собранные ответы
+# ---------- Вопросы для глубокого опроса ----------
+DEEP_QUESTIONS = [
+    {"text": "Как вы оцениваете свою энергию сегодня? (1 - совсем нет сил, 5 - очень энергичен)", "key": "energy", "type": "scale", "min":1, "max":5},
+    {"text": "Чувствуете ли вы апатию, безразличие? (1 - нет, 5 - очень сильная апатия)", "key": "apathy", "type": "scale", "min":1, "max":5},
+    {"text": "Оцените уровень агрессии (1 - нет, 5 - очень агрессивен)", "key": "aggression", "type": "scale", "min":1, "max":5},
+    {"text": "Как сильно вы раздражены? (1 - нет, 5 - постоянно раздражён)", "key": "irritation", "type": "scale", "min":1, "max":5},
+    {"text": "Оцените уровень тревожности (1 - нет, 5 - очень высокая)", "key": "anxiety", "type": "scale", "min":1, "max":5},
+]
+
+# Хранилище состояний опроса: user_id -> {"step": int, "answers": dict, "type": "daily"/"deep"}
 poll_states = {}
 
 # ---------- Команда /start ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    # Инициализируем пользователя в базе (если ещё нет)
-    db.get_user(user_id)
+    db.get_user(user_id)  # инициализируем пользователя
     await message.answer(
         "Привет! Я бот для отслеживания эмоционального состояния.\n"
         "Каждый день я буду задавать несколько вопросов, чтобы оценить ваше самочувствие.\n"
-        "Вы также можете пройти тест на тревожность/депрессию или посмотреть статистику.",
+        "Вы также можете пройти глубокий опрос, тест или посмотреть статистику.",
         reply_markup=get_main_keyboard()
     )
 
@@ -68,9 +76,7 @@ async def stats_menu(message: types.Message):
 
 @dp.message(lambda msg: msg.text == "🧪 Пройти тест")
 async def test_menu(message: types.Message):
-    # Здесь можно предложить выбор теста, но для примера сделаем один простой тест
     await message.answer("Выберите тест:\n1. Тест на тревожность (GAD-7) – скоро будет...\nПока просто команда /test для демо")
-    # Можно сразу запустить тест, но для упрощения пока заглушка
 
 @dp.message(lambda msg: msg.text == "💡 Методики")
 async def methods_menu(message: types.Message):
@@ -85,6 +91,28 @@ async def methods_menu(message: types.Message):
         "- Дневник эмоций"
     )
     await message.answer(text)
+
+# ---------- НОВОЕ: Обработка кнопки глубокого опроса ----------
+@dp.message(lambda msg: msg.text == "📝 Глубокий опрос")
+async def deep_poll_start(message: types.Message):
+    user_id = message.from_user.id
+    # Если пользователь уже в процессе опроса, можно предупредить, но для простоты просто начнём заново
+    if user_id in poll_states:
+        await message.answer("Предыдущий опрос прерван. Начинаем глубокий опрос.")
+    # Запускаем глубокий опрос
+    poll_states[user_id] = {
+        "step": 0,
+        "answers": {},
+        "type": "deep"
+    }
+    await message.answer(
+        DEEP_QUESTIONS[0]["text"],
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(str(i)) for i in range(1, 6)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+    )
 
 # ---------- Обработка инлайн-кнопок (статистика) ----------
 @dp.callback_query(lambda c: c.data.startswith("stats_"))
@@ -108,38 +136,69 @@ async def process_stats_callback(callback: types.CallbackQuery):
         start_date = now - timedelta(days=30)
     
     # Фильтруем ответы за период
-    filtered = [a for a in answers if datetime.fromisoformat(a["date"]) >= start_date]
+    filtered = []
+    for a in answers:
+        # Поддержка старых записей (без поля date? но они должны быть)
+        if "date" in a:
+            try:
+                d = datetime.fromisoformat(a["date"])
+                if d >= start_date:
+                    filtered.append(a)
+            except:
+                continue
+        else:
+            # Если нет даты, пропускаем
+            continue
     
     if not filtered:
         await callback.message.edit_text(f"Нет данных за выбранный период ({period}).")
         await callback.answer()
         return
     
-    # Вычисляем средние значения
-    total_feeling = sum(a["feeling"] for a in filtered)
-    total_anxiety = sum(a["anxiety"] for a in filtered)
-    total_aggression = sum(a["aggression"] for a in filtered)
-    count = len(filtered)
+    # Собираем все числовые поля (кроме 'date' и 'type')
+    field_values = {}
+    for entry in filtered:
+        for key, value in entry.items():
+            if key in ("date", "type"):
+                continue
+            # Пытаемся привести к числу (на случай если значение сохранено как строка)
+            try:
+                val = float(value)
+            except (ValueError, TypeError):
+                continue
+            if key not in field_values:
+                field_values[key] = []
+            field_values[key].append(val)
     
-    stats_text = (
-        f"📊 Статистика за {period}:\n"
-        f"Количество записей: {count}\n"
-        f"Среднее настроение: {total_feeling/count:.1f}/5\n"
-        f"Средняя тревога: {total_anxiety/count:.1f}/5\n"
-        f"Дней с агрессией: {total_aggression}"
-    )
-    await callback.message.edit_text(stats_text)
+    # Формируем статистику
+    lines = [f"📊 Статистика за {period}:"]
+    lines.append(f"Количество записей: {len(filtered)}")
+    for key, values in field_values.items():
+        avg = sum(values) / len(values)
+        # Красивое название поля
+        field_names = {
+            "feeling": "Настроение",
+            "anxiety": "Тревога",
+            "aggression": "Агрессия",
+            "energy": "Энергия",
+            "apathy": "Апатия",
+            "irritation": "Раздражение"
+        }
+        display_name = field_names.get(key, key.capitalize())
+        lines.append(f"{display_name}: {avg:.1f}/5")
+    
+    await callback.message.edit_text("\n".join(lines))
     await callback.answer()
 
-# ---------- Запуск ежедневного опроса ----------
+# ---------- Запуск ежедневного опроса (немного изменён: добавляем тип) ----------
 async def send_daily_poll(user_id):
-    """Отправляет пользователю первый вопрос опроса"""
-    # Проверяем, не проходит ли он уже опрос (чтобы не наслаивать)
+    """Отправляет пользователю первый вопрос ежедневного опроса"""
     if user_id in poll_states:
         return
     poll_states[user_id] = {
         "step": 0,
-        "answers": {}
+        "answers": {},
+        "type": "daily"
     }
     await bot.send_message(
         user_id,
@@ -164,7 +223,7 @@ async def scheduled_polls():
         if last_poll is None or datetime.fromisoformat(last_poll).date() < now.date():
             await send_daily_poll(int(user_id_str))
 
-# ---------- Обработка ответов на вопросы ----------
+# ---------- Обработка ответов на вопросы (обновлена для работы с двумя типами) ----------
 @dp.message()
 async def handle_poll_answer(message: types.Message):
     user_id = message.from_user.id
@@ -176,10 +235,18 @@ async def handle_poll_answer(message: types.Message):
     
     state = poll_states[user_id]
     step = state["step"]
-    question = QUESTIONS[step]
+    poll_type = state.get("type", "daily")  # по умолчанию daily для обратной совместимости
+    
+    # Выбираем соответствующий список вопросов
+    if poll_type == "daily":
+        questions = QUESTIONS
+    else:
+        questions = DEEP_QUESTIONS
+    
+    question = questions[step]
     answer_text = message.text.strip()
     
-    # Валидация ответа (число и в нужном диапазоне)
+    # Валидация ответа
     try:
         value = int(answer_text)
     except ValueError:
@@ -198,10 +265,10 @@ async def handle_poll_answer(message: types.Message):
     
     # Переходим к следующему вопросу или завершаем
     next_step = step + 1
-    if next_step < len(QUESTIONS):
+    if next_step < len(questions):
         state["step"] = next_step
         await message.answer(
-            QUESTIONS[next_step]["text"],
+            questions[next_step]["text"],
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[[KeyboardButton(str(i)) for i in range(1, 6)]],
                 resize_keyboard=True,
@@ -210,39 +277,54 @@ async def handle_poll_answer(message: types.Message):
         )
     else:
         # Опрос завершён
-        # Сохраняем ответы в базу
+        # Формируем запись для сохранения
+        now_iso = datetime.now().isoformat()
+        entry = {
+            "date": now_iso,
+            "type": poll_type,
+            **state["answers"]
+        }
+        
+        # Сохраняем в базу
         user_data = db.get_user(user_id)
         answers = user_data.get("answers", [])
-        now = datetime.now().isoformat()
-        answers.append({
-            "date": now,
-            **state["answers"]
-        })
-        db.update_user(user_id, {"answers": answers, "last_poll_time": now})
+        answers.append(entry)
+        # Обновляем last_poll_time только для daily опросов? Для статистики можно обновлять всегда, но для расписания важно daily.
+        updates = {"answers": answers}
+        if poll_type == "daily":
+            updates["last_poll_time"] = now_iso
+        db.update_user(user_id, updates)
         
         # Удаляем состояние
         del poll_states[user_id]
         
-        # Простой анализ и рекомендация
-        feeling = state["answers"]["feeling"]
-        anxiety = state["answers"]["anxiety"]
-        aggression = state["answers"]["aggression"]
-        
-        advice = ""
-        if feeling <= 2:
-            advice += "Ваше настроение низкое. Попробуйте сделать что-то приятное для себя.\n"
-        if anxiety >= 4:
-            advice += "Уровень тревоги высокий. Рекомендую дыхательное упражнение 4-7-8.\n"
-        if aggression == 1:
-            advice += "Была агрессия. Попробуйте физическую активность или дневник эмоций.\n"
-        
-        if not advice:
-            advice = "У вас всё хорошо! Так держать."
-        
-        await message.answer(
-            f"Спасибо за ответы!\n{advice}",
-            reply_markup=get_main_keyboard()
-        )
+        # Простой анализ и рекомендация (только для daily, для deep можно свой)
+        if poll_type == "daily":
+            feeling = state["answers"].get("feeling", 3)
+            anxiety = state["answers"].get("anxiety", 3)
+            aggression = state["answers"].get("aggression", 0)
+            
+            advice = ""
+            if feeling <= 2:
+                advice += "Ваше настроение низкое. Попробуйте сделать что-то приятное для себя.\n"
+            if anxiety >= 4:
+                advice += "Уровень тревоги высокий. Рекомендую дыхательное упражнение 4-7-8.\n"
+            if aggression == 1:
+                advice += "Была агрессия. Попробуйте физическую активность или дневник эмоций.\n"
+            
+            if not advice:
+                advice = "У вас всё хорошо! Так держать."
+            
+            await message.answer(
+                f"Спасибо за ответы!\n{advice}",
+                reply_markup=get_main_keyboard()
+            )
+        else:
+            # Для глубокого опроса можно дать общую обратную связь (по желанию)
+            await message.answer(
+                "Спасибо за прохождение глубокого опроса! Ваши ответы сохранены.",
+                reply_markup=get_main_keyboard()
+            )
 
 # ---------- Запуск бота ----------
 async def main():
